@@ -27,6 +27,7 @@ import (
 
 	ebackoff "github.com/cenkalti/backoff"
 	"github.com/jonboulle/clockwork"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/client"
 )
@@ -355,29 +356,209 @@ func (l *Client) Close() error {
 	return nil
 }
 
-// IsNotFound determines if the specified error identifies a node not found event
-func IsNotFound(err error) bool {
-	e, ok := err.(client.Error)
-	if !ok {
-		return false
-	}
-	return e.Code == client.ErrorCodeKeyNotFound
+type ActionCallbackFn func(a Action)
+
+func (l *Client) AddRecursiveWatchCallback(key string, fn ActionCallbackFn) {
+	ctx, cancel := context.WithCancel(context.Background())
+	valuesC := make(chan Action)
+	go func() {
+		for {
+			select {
+			case <-l.closeC:
+				cancel()
+				return
+			case val := <-valuesC:
+				fn(val)
+			}
+		}
+	}()
+	logger := log.WithField("key", key)
+	logger.WithField("peers", l.client.Endpoints()).Info("Setting up watch.")
+	go l.watchRecursiveLoop(ctx, key, valuesC, logger)
 }
 
-// IsAlreadyExist determines if the specified error identifies a duplicate node event
-func IsAlreadyExist(err error) bool {
-	e, ok := err.(client.Error)
-	if !ok {
-		return false
+func (l *Client) LeaseLoop(ctx context.Context, key, value string, ttl time.Duration) {
+	logger := log.WithFields(logrus.Fields{
+		"key":   key,
+		"value": value,
+		"ttl":   ttl,
+	})
+	ticker := time.NewTicker(ttl / 5)
+	defer func() {
+		ticker.Stop()
+	}()
+	err := l.elect(key, value, ttl)
+	if err != nil {
+		logger.WithError(err).Warn("Failed to run election term.")
 	}
-	return e.Code == client.ErrorCodeNodeExist
+	for {
+		select {
+		case <-l.pauseC:
+			logger.Info("Step down.")
+			select {
+			case <-ticker.C:
+				logger.Info("Resume election participation.")
+			case <-l.closeC:
+				return
+			}
+		case <-l.closeC:
+			logger.Info("Client is closing.")
+			return
+		case <-ctx.Done():
+			logger.Info("LeaseLoop is closed.")
+			return
+		case <-ticker.C:
+			err := l.elect(key, value, ttl)
+			if err != nil {
+				logger.WithError(err).Warn("Failed to run election term.")
+			}
+		}
+	}
 }
 
-// IsWatchExpired determins if the specified error identifies an expired watch event
-func IsWatchExpired(err error) bool {
-	switch clientErr := err.(type) {
-	case client.Error:
-		return clientErr.Code == client.ErrorCodeEventIndexCleared
+func (l *Client) watchRecursiveLoop(ctx context.Context, key string, valuesC chan Action, logger logrus.FieldLogger) {
+	boff := newBackoff()
+	// maxFailedSteps sets the limit on the number of failed attempts before the watch
+	// is forcibly reset
+	const maxFailedSteps = 10
+	var (
+		api     = client.NewKeysAPI(l.client)
+		watcher client.Watcher
+	)
+	var err error
+	for {
+		select {
+		case <-time.After(boff.NextBackOff()):
+		case <-l.closeC:
+			logger.Info("Watch loop closing.")
+			return
+		}
+		if watcher == nil {
+			watcher, err = l.getRecursiveWatch(ctx, api, key, valuesC, logger)
+			if err != nil {
+				if IsContextError(err) {
+					logger.Info("Context expired, watch loop closing.")
+					return
+				} else if IsWatchExpired(err) {
+					// The watcher has expired, reset it so it's recreated on the
+					// next loop cycle.
+					logger.Warn("Watch has expired, resetting watch index.")
+					watcher = nil
+				} else {
+					logger.WithError(err).Warn("Failed to create watch at latest index.")
+					boff.inc()
+					if boff.count() > maxFailedSteps {
+						logger.Info("Reset watcher at latest index.")
+						watcher = nil
+						boff.Reset()
+					}
+				}
+				continue
+			}
+			//Successful return means the current value has already been sent to receiver
+		}
+		for {
+			resp, err := watcher.Next(ctx)
+			if err != nil {
+				if IsContextError(err) {
+					return
+				}
+				logger.WithError(err).Warn("Failed to retrieve event from watcher.")
+				watcher = nil
+				break
+			}
+			boff.Reset()
+			actions := respToActions(resp)
+			for _, action := range actions {
+				select {
+				case valuesC <- action:
+				case <-l.closeC:
+					logger.Info("Watcher is closing.")
+					return
+				}
+			}
+		}
 	}
-	return false
+}
+
+func respToActions(resp *client.Response) []Action {
+	if resp == nil || resp.Node == nil {
+		return nil
+	}
+	t := toActionType(resp.Action)
+	// this is not a update
+	if !resp.Node.Dir && t == ActionTypeUpdate &&
+		resp.PrevNode != nil &&
+		resp.PrevNode.Key == resp.Node.Key &&
+		resp.PrevNode.Value == resp.Node.Value {
+		return nil
+	}
+	return nodeToActions(t, resp.Node)
+}
+
+func nodeToActions(t ActionType, node *client.Node) []Action {
+	if node == nil {
+		return nil
+	}
+	result := make([]Action, 0)
+	if !node.Dir {
+		result = append(result, Action{
+			Type:  t,
+			Key:   node.Key,
+			Value: node.Value,
+		})
+		return result
+	}
+	for _, n := range node.Nodes {
+		result = append(result, nodeToActions(t, n)...)
+	}
+	return result
+}
+
+func toActionType(val string) ActionType {
+	switch val {
+	case "get", "set", "create":
+		return ActionTypeCreate
+	case "compareAndSwap", "update":
+		return ActionTypeUpdate
+	case "compareAndDelete", "expire", "delete":
+		return ActionTypeDelete
+	}
+	return ActionType(val)
+}
+
+func (l *Client) getRecursiveWatch(ctx context.Context, api client.KeysAPI, key string, valuesC chan Action, logger logrus.FieldLogger) (client.Watcher, error) {
+	logger = logger.WithField("key", key)
+	logger.Info("Recreating watch at the latest index.")
+	resp, err := api.Get(ctx, key, &client.GetOptions{
+		Recursive: true,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// After reestablishing the watch, always send the value we got to the client.
+	if resp.Node != nil {
+		logger.WithFields(logrus.Fields{
+			"value": resp.Node.Value,
+			"index": resp.Index,
+		}).Info("Got current value.")
+		actions := respToActions(resp)
+		for _, action := range actions {
+			select {
+			case valuesC <- action:
+			case <-l.closeC:
+				return nil, trace.LimitExceeded("client closed")
+			}
+		}
+
+	}
+	// The watcher that will be receiving events after the value we got above.
+	watcher := api.Watcher(key, &client.WatcherOptions{
+		Recursive: true,
+		// Response.Index corresponds to X-Etcd-Index response header field
+		// and is the recommended starting point after a history miss of over
+		// 1000 events
+		AfterIndex: resp.Index,
+	})
+	return watcher, nil
 }
