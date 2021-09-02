@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -72,6 +73,134 @@ func (s *LeaderSuite) TestLeaderElectSingle(c *C) {
 	case <-time.After(time.Second):
 		c.Fatal("Timeout waiting for event.")
 	}
+}
+
+func (s *LeaderSuite) TestLease(c *C) {
+	clt := s.newClient(c)
+	defer clt.Close()
+
+	prefix := fmt.Sprintf("/planet/tests/%v/lease", uuid.New())
+	key1 := fmt.Sprintf("%s/%s", prefix, "master-1")
+	key2 := fmt.Sprintf("%s/%s", prefix, "master-2")
+	key3 := fmt.Sprintf("%s/%s", prefix, "master-3")
+
+	result := make([]Action, 0)
+	watchCtx, watchCancelFn := context.WithCancel(context.Background())
+	clt.AddRecursiveWatchCallback(watchCtx, prefix, func(a Action) {
+		result = append(result, a)
+	})
+	go clt.LeaseLoop(context.TODO(), key1, "master-1", time.Second)
+	go clt.LeaseLoop(context.TODO(), key2, "master-2", time.Second)
+	go clt.LeaseLoop(context.TODO(), key3, "master-3", time.Second)
+
+	<-time.After(time.Second)
+	watchCancelFn()
+	_ = clt.Close()
+	sortAction(result)
+	c.Assert(result, DeepEquals, []Action{
+		{
+			Type:  ActionTypeCreate,
+			Key:   key1,
+			Value: "master-1",
+		},
+		{
+			Type:  ActionTypeCreate,
+			Key:   key2,
+			Value: "master-2",
+		},
+		{
+			Type:  ActionTypeCreate,
+			Key:   key3,
+			Value: "master-3",
+		},
+	})
+}
+
+func (s *LeaderSuite) TestReceiveRecursiveExistingValue(c *C) {
+	clt := s.newClient(c)
+	defer s.closeClient(c, clt)
+
+	prefix := fmt.Sprintf("/planet/tests/%v/lease", uuid.New())
+
+	key1 := prefix + "/key1"
+	key2 := prefix + "/key2"
+	key3 := prefix + "/key3"
+
+	result := make([]Action, 0)
+	watchCtx, watchCancelFn := context.WithCancel(context.Background())
+	clt.AddRecursiveWatchCallback(watchCtx, prefix, func(a Action) {
+		result = append(result, a)
+	})
+	api := client.NewKeysAPI(clt.Client)
+	_, err := api.Set(context.TODO(), key1, "value1", nil)
+	c.Assert(err, IsNil)
+	_, err = api.Set(context.TODO(), key2, "value2", nil)
+	c.Assert(err, IsNil)
+	_, err = api.Set(context.TODO(), key3, "value3", nil)
+	c.Assert(err, IsNil)
+
+	<-time.After(time.Second)
+	watchCancelFn()
+	_ = clt.Close()
+	sortAction(result)
+	c.Assert(result, DeepEquals, []Action{
+		{
+			Type:  ActionTypeCreate,
+			Key:   key1,
+			Value: "value1",
+		},
+		{
+			Type:  ActionTypeCreate,
+			Key:   key2,
+			Value: "value2",
+		},
+		{
+			Type:  ActionTypeCreate,
+			Key:   key3,
+			Value: "value3",
+		},
+	})
+}
+
+func (s *LeaderSuite) TestExpireLease(c *C) {
+	clt := s.newClient(c)
+	defer s.closeClient(c, clt)
+
+	prefix := fmt.Sprintf("/planet/tests/%v/lease", uuid.New())
+
+	key1 := prefix + "/key1"
+
+	result := make([]Action, 0)
+	watchCtx, watchCancelFn := context.WithCancel(context.Background())
+	clt.AddRecursiveWatchCallback(watchCtx, prefix, func(a Action) {
+		result = append(result, a)
+	})
+	ctx, cancelFunc := context.WithTimeout(context.Background(), time.Second/2)
+	defer cancelFunc()
+	go clt.LeaseLoop(ctx, key1, "value1", time.Second)
+
+	<-time.After(2 * time.Second)
+	watchCancelFn()
+	_ = clt.Close()
+	sortAction(result)
+	c.Assert(result, DeepEquals, []Action{
+		{
+			Type:  ActionTypeCreate,
+			Key:   key1,
+			Value: "value1",
+		},
+		{
+			Type:  ActionTypeDelete,
+			Key:   key1,
+			Value: "",
+		},
+	})
+}
+
+func sortAction(a []Action) {
+	sort.SliceStable(a, func(i, j int) bool {
+		return a[i].Key < a[j].Key
+	})
 }
 
 func (s *LeaderSuite) TestReceiveExistingValue(c *C) {
