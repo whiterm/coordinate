@@ -124,6 +124,28 @@ func (l *Client) AddWatchCallback(key string, fn CallbackFn) {
 	}()
 }
 
+type ActionCallbackFn func(a Action)
+
+func (l *Client) AddRecursiveWatchCallback(ctx context.Context, key string, fn ActionCallbackFn) {
+	valuesC := make(chan Action)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-l.closeC:
+				return
+			case val := <-valuesC:
+				fn(val)
+			}
+		}
+	}()
+	logger := log.WithField("key", key)
+	logger.WithField("peers", l.Client.Endpoints()).Info("Setting up watch.")
+	l.wg.Add(1)
+	go l.watchRecursiveLoop(ctx, key, valuesC, logger)
+}
+
 // AddWatch starts watching the key for changes and sending them
 // to the valuesC until the client is stopped.
 func (l *Client) AddWatch(key string, valuesC chan string) {
@@ -154,6 +176,45 @@ func (l *Client) AddVoter(ctx context.Context, key, value string, term time.Dura
 	case l.voterC <- true:
 	case <-ctx.Done():
 	case <-l.closeC:
+	}
+}
+
+func (l *Client) LeaseLoop(ctx context.Context, key, value string, ttl time.Duration) {
+	logger := log.WithFields(logrus.Fields{
+		"key":   key,
+		"value": value,
+		"ttl":   ttl,
+	})
+	ticker := time.NewTicker(ttl / 5)
+	defer func() {
+		ticker.Stop()
+	}()
+	err := l.elect(ctx, key, value, ttl, logger)
+	if err != nil {
+		logger.WithError(err).Warn("Failed to run election term.")
+	}
+	for {
+		select {
+		case <-l.pauseC:
+			logger.Info("Step down.")
+			select {
+			case <-ticker.C:
+				logger.Info("Resume election participation.")
+			case <-l.closeC:
+				return
+			}
+		case <-l.closeC:
+			logger.Info("Client is closing.")
+			return
+		case <-ctx.Done():
+			logger.Info("LeaseLoop is closed.")
+			return
+		case <-ticker.C:
+			err := l.elect(ctx, key, value, ttl, logger)
+			if err != nil {
+				logger.WithError(err).Warn("Failed to run election term.")
+			}
+		}
 	}
 }
 
@@ -195,6 +256,72 @@ func (l *Client) startVoterLoop(key, value string, term time.Duration, enabled b
 		cancel()
 	}()
 	go l.voterLoop(ctx, key, value, term, enabled)
+}
+
+func (l *Client) watchRecursiveLoop(ctx context.Context, key string, valuesC chan Action, logger logrus.FieldLogger) {
+	defer l.wg.Done()
+	boff := newBackoff()
+	// maxFailedSteps sets the limit on the number of failed attempts before the watch
+	// is forcibly reset
+	const maxFailedSteps = 10
+	var (
+		api     = client.NewKeysAPI(l.Client)
+		watcher client.Watcher
+	)
+	var err error
+	for {
+		select {
+		case <-time.After(boff.NextBackOff()):
+		case <-l.closeC:
+			logger.Info("Watch loop closing.")
+			return
+		}
+		if watcher == nil {
+			watcher, err = l.getRecursiveWatch(ctx, api, key, valuesC, logger)
+			if err != nil {
+				if IsContextError(err) {
+					logger.Info("Context expired, watch loop closing.")
+					return
+				} else if IsWatchExpired(err) {
+					// The watcher has expired, reset it so it's recreated on the
+					// next loop cycle.
+					logger.Warn("Watch has expired, resetting watch index.")
+					watcher = nil
+				} else {
+					logger.WithError(err).Warn("Failed to create watch at latest index.")
+					boff.inc()
+					if boff.count() > maxFailedSteps {
+						logger.Info("Reset watcher at latest index.")
+						watcher = nil
+						boff.Reset()
+					}
+				}
+				continue
+			}
+			//Successful return means the current value has already been sent to receiver
+		}
+		for {
+			resp, err := watcher.Next(ctx)
+			if err != nil {
+				if IsContextError(err) {
+					return
+				}
+				logger.WithError(err).Warn("Failed to retrieve event from watcher.")
+				watcher = nil
+				break
+			}
+			boff.Reset()
+			actions := respToActions(resp)
+			for _, action := range actions {
+				select {
+				case valuesC <- action:
+				case <-l.closeC:
+					logger.Info("Watcher is closing.")
+					return
+				}
+			}
+		}
+	}
 }
 
 func (l *Client) watchLoop(ctx context.Context, key string, valuesC chan string) {
@@ -328,6 +455,88 @@ func (l *Client) voterLoop(ctx context.Context, key, value string, term time.Dur
 			return
 		}
 	}
+}
+
+func respToActions(resp *client.Response) []Action {
+	if resp == nil || resp.Node == nil {
+		return nil
+	}
+	t := toActionType(resp.Action)
+	// this is not a update
+	if !resp.Node.Dir && t == ActionTypeUpdate &&
+		resp.PrevNode != nil &&
+		resp.PrevNode.Key == resp.Node.Key &&
+		resp.PrevNode.Value == resp.Node.Value {
+		return nil
+	}
+	return nodeToActions(t, resp.Node)
+}
+
+func nodeToActions(t ActionType, node *client.Node) []Action {
+	if node == nil {
+		return nil
+	}
+	result := make([]Action, 0)
+	if !node.Dir {
+		result = append(result, Action{
+			Type:  t,
+			Key:   node.Key,
+			Value: node.Value,
+		})
+		return result
+	}
+	for _, n := range node.Nodes {
+		result = append(result, nodeToActions(t, n)...)
+	}
+	return result
+}
+
+func toActionType(val string) ActionType {
+	switch val {
+	case "get", "set", "create":
+		return ActionTypeCreate
+	case "compareAndSwap", "update":
+		return ActionTypeUpdate
+	case "compareAndDelete", "expire", "delete":
+		return ActionTypeDelete
+	}
+	return ActionType(val)
+}
+
+func (l *Client) getRecursiveWatch(ctx context.Context, api client.KeysAPI, key string, valuesC chan Action, logger logrus.FieldLogger) (client.Watcher, error) {
+	logger = logger.WithField("key", key)
+	logger.Info("Recreating watch at the latest index.")
+	resp, err := api.Get(ctx, key, &client.GetOptions{
+		Recursive: true,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	// After reestablishing the watch, always send the value we got to the client.
+	if resp.Node != nil {
+		logger.WithFields(logrus.Fields{
+			"value": resp.Node.Value,
+			"index": resp.Index,
+		}).Info("Got current value.")
+		actions := respToActions(resp)
+		for _, action := range actions {
+			select {
+			case valuesC <- action:
+			case <-l.closeC:
+				return nil, trace.LimitExceeded("client closed")
+			}
+		}
+
+	}
+	// The watcher that will be receiving events after the value we got above.
+	watcher := api.Watcher(key, &client.WatcherOptions{
+		Recursive: true,
+		// Response.Index corresponds to X-Etcd-Index response header field
+		// and is the recommended starting point after a history miss of over
+		// 1000 events
+		AfterIndex: resp.Index,
+	})
+	return watcher, nil
 }
 
 func (l *Client) getWatchAtLatestIndex(ctx context.Context, api client.KeysAPI, key string, valuesC chan string, logger logrus.FieldLogger) (client.Watcher, error) {
